@@ -10,8 +10,12 @@ $ git switch main      # in a repo another agent is mid-edit on
 bulletin-board: ~/Sites/ko-sites is claimed by another agent.
   • grind:%2 (pid 8123) @ feat/caddy-map — claimed 14m ago, expires in 1h46m
     "rebuilding Caddy map"
-Proceeding may clobber their work. Allow this git op anyway? [y/N]
+Don't switch branches here — work in an isolated copy instead:
+  bb fork <name>   (clones to ~/Sites/ko-sites-<name>, claimed for you)
+Allow this git op anyway? [y/N]
 ```
+
+The gate doesn't just block — it **routes** you to the right move: rather than fight over a checkout, `bb fork <name>` makes an isolated copy in `Sites/<repo>-<name>` (fresh clone by default; `--worktree` for a linked worktree), claims it for you, and tells you where to `cd`.
 
 ## Why
 
@@ -62,6 +66,7 @@ bb claim -m "refactoring auth"   # claim cwd's repo (2h TTL, current branch)
 bb check                          # who else is here? (exit 3 = conflict)
 bb note "staging DB migrated" -g  # broadcast a context change to all agents
 bb unread                         # what changed while I was heads-down
+bb fork auth                      # claimed dir? isolated copy in Sites/<repo>-auth
 bb release                        # done (or let the TTL expire)
 bb list                           # everything live
 ```

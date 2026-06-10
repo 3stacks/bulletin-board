@@ -151,6 +151,12 @@ function renderConflict(target: string, conflicts: Bulletin[]): string {
     );
     if (c.message) lines.push(`    "${c.message}"`);
   }
-  lines.push(`Proceeding may clobber their work. Allow this git op anyway?`);
+  // Route to the right resolution: don't fight over the checkout — work in an
+  // isolated copy. `bb fork` clones into Sites/<repo>-<name> and claims it.
+  lines.push(
+    `Don't switch branches here — work in an isolated copy instead:`,
+    `  bb fork <name>   (clones to ${short}-<name>, claimed for you)`,
+    `Allow this git op anyway?`,
+  );
   return lines.join("\n");
 }

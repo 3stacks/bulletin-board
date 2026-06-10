@@ -16,6 +16,9 @@
  *   bb whoami            show your agent id + db path
  */
 
+import { execSync } from "child_process";
+import { existsSync } from "fs";
+import { basename, dirname, join } from "path";
 import {
   agentDisplay,
   agentKey,
@@ -299,6 +302,66 @@ function cmdUnread(argv: string[]): void {
   printList(rows, "");
 }
 
+function sh(cmd: string): string {
+  return execSync(cmd, { stdio: ["pipe", "pipe", "pipe"] }).toString().trim();
+}
+function shOrNull(cmd: string): string | null {
+  try { return sh(cmd); } catch { return null; }
+}
+function q(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Resolve a directory conflict the right way: instead of fighting over a
+ * claimed checkout, make an isolated copy in Sites/<repo>-<name> and work there.
+ * Default is a fresh clone (independent .git/remote); --worktree for a linked
+ * worktree. The new copy is claimed for you and you're told where to cd.
+ */
+function cmdFork(argv: string[]): void {
+  const { positionals, flags } = parseArgs(argv, {
+    bool: ["worktree"],
+    value: ["branch", "from"],
+    alias: { b: "branch", w: "worktree" },
+  });
+  const name = positionals[0];
+  if (!name) fail("usage: bb fork <name> [--branch <b>] [--worktree] [--from <dir>]");
+
+  const source = canonicalDir((flags.from as string) ?? undefined, process.cwd());
+  const root = findGitRoot(source);
+  if (!root) fail(`not inside a git repo: ${tilde(source)}`);
+  const repoName = basename(root);
+  const target = join(dirname(root), `${repoName}-${name}`);
+  if (existsSync(target)) fail(`target already exists: ${tilde(target)}`);
+  const branch = (flags.branch as string) ?? name;
+
+  if (flags.worktree) {
+    sh(`git -C ${q(root)} worktree add ${q(target)} -b ${q(branch)}`);
+  } else {
+    // Fast local clone (git hardlinks objects on the same filesystem), then
+    // point origin at the real remote so pushes go to the right place.
+    sh(`git clone --quiet ${q(root)} ${q(target)}`);
+    const origin = shOrNull(`git -C ${q(root)} remote get-url origin`);
+    if (origin) sh(`git -C ${q(target)} remote set-url origin ${q(origin)}`);
+    // Give the agent its own branch; fall back to switching if it already exists.
+    if (shOrNull(`git -C ${q(target)} switch --quiet -c ${q(branch)}`) === null)
+      shOrNull(`git -C ${q(target)} switch --quiet ${q(branch)}`);
+  }
+
+  // Claim the new home so a third agent sees it's taken.
+  const db = openBoard()!;
+  post(db, {
+    kind: "claim", scope: "dir", path: target, branch,
+    message: `forked from ${repoName}`, ttl: DEFAULT_TTL.claim,
+    agent: agentKey(), display: agentDisplay(), pid: agentPid(),
+  });
+
+  console.log(
+    `✅ Forked ${repoName} → ${tilde(target)} @ ${branch} (${flags.worktree ? "worktree" : "clone"}); claimed for you.`,
+  );
+  console.log(`   cd ${tilde(target)}`);
+}
+
 /**
  * Claude Code lifecycle hooks. Wired in settings.json:
  *   SessionStart → bb hook session-start   (claim this repo for the session)
@@ -411,6 +474,9 @@ USAGE
      --peek (don't advance cursor) | --quiet | --json
   bb note <text>           Post a note
      -g, --global | -p, --path <dir> | -t, --ttl <dur>
+  bb fork <name>           Isolated copy of this repo in Sites/<repo>-<name>,
+                           claimed for you (use when a dir is claimed by another)
+     -b, --branch <b> | --worktree | --from <dir>
   bb gc [--days N]         Purge old released/expired rows (default 7d)
   bb whoami                Show your agent id + db path
   bb hook <event>          Internal: Claude Code lifecycle hooks
@@ -432,6 +498,7 @@ try {
     case "list": case undefined: cmdList(rest); break;
     case "unread": case "inbox": cmdUnread(rest); break;
     case "note": cmdNote(rest); break;
+    case "fork": cmdFork(rest); break;
     case "hook": await cmdHook(rest); break;
     case "gc": cmdGc(rest); break;
     case "whoami": cmdWhoami(); break;
