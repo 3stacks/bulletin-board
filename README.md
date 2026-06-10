@@ -45,19 +45,23 @@ export default definePolicy([
 
 > **Ordering matters — put the gate first.** toolgate returns the *first* non-`next` verdict, so the gate must run **before** any "allow non-destructive bash/git" policy, or that policy will greenlight `git switch`/`checkout` (it doesn't consider them destructive) before the gate can ask. toolgate also loads `toolgate.config.local.ts` **before** `toolgate.config.ts`, and inner directories before outer ones. So place the gate at the **top of the earliest-loaded config** on the path from your repos up to `$HOME` — in practice, the first entry of your `toolgate.config.local.ts`. Verify with `toolgate test --why Bash '{"command":"git switch x"}'`: the deciding policy should be `Guard claimed directories`, not an allow policy. Set `BB_DEBUG=1` to trace the gate's decision.
 
-### Auto-claim per session (optional)
+### Lifecycle hooks (optional)
 
-Wire the lifecycle hooks so each Claude Code instance claims its repo automatically — no need to remember `bb claim`:
+Wire the hooks so each Claude Code instance claims its repo automatically and sees the board update itself — no need to remember `bb claim` or `bb unread`:
 
 ```jsonc
 // ~/.claude/settings.json
 "hooks": {
-  "SessionStart": [{ "hooks": [{ "type": "command", "command": "bb hook session-start" }] }],
-  "SessionEnd":   [{ "hooks": [{ "type": "command", "command": "bb hook session-end" }] }]
+  "SessionStart":     [{ "hooks": [{ "type": "command", "command": "bb hook session-start" }] }],
+  "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "bb hook session-end" }] }],
+  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "bb hook prompt" }] }]
 }
 ```
 
-`session-start` claims the repo at the session's cwd (8h TTL, idempotent — resume/compact refresh rather than duplicate) and injects a one-line confirmation plus any unread count into context. `session-end` releases it; the TTL is the crash backstop. Non-repo directories are skipped. Identity is shared with the gate via `$TMUX_PANE`/`$BB_AGENT`, so a session never prompts on its own claim.
+- **`session-start`** claims the repo at the session's cwd (8h TTL, idempotent — resume/compact refresh rather than duplicate) and injects a one-line confirmation plus any unread count. **`session-end`** releases it; the TTL is the crash backstop. Non-repo dirs are skipped.
+- **`prompt`** is the context feed: before each turn it injects any bulletins posted by *other* agents since this agent's last turn, then advances the cursor (each shown once). This is how a mid-session broadcast (`bb note "staging DB migrated" -g`) reaches the other agents without anyone running `bb unread`. Silent when nothing is new.
+
+Identity is shared across all hooks and the gate via `$TMUX_PANE`/`$BB_AGENT`, so a session never prompts on its own claim or sees its own notes.
 
 ## Use
 
@@ -88,12 +92,16 @@ Key decisions:
 - **The gate fails open.** Any error → the op proceeds. A coordination tool must never wedge an agent.
 - **Storage is volatile and untracked** (`~/.bulletin-board/board.db`, gitignored) — it's live coordination state, not history to commit.
 
+## Shipped
+
+- **Conflict routing** — the gate sends a blocked agent to `bb fork <name>` (isolated copy in `Sites/<repo>-<name>`) instead of just warning.
+- **Auto-claim / auto-release** — `SessionStart` claims the cwd repo, `SessionEnd` releases it (`bb hook`).
+- **Context-feed hook** — `UserPromptSubmit` injects other agents' new bulletins into context each turn (`bb hook prompt`), so a mid-session broadcast reaches everyone without a manual `bb unread`.
+
 ## Roadmap
 
 Natural extensions, roughly by value:
 
-- **Context-feed hook** — a `SessionStart` / `UserPromptSubmit` hook that runs `bb unread --quiet` and injects new bulletins into an agent's context, so a mid-session change ("I just migrated the shared DB") *reaches* other agents instead of waiting to be pulled.
-- **Auto-claim / auto-release** — `SessionStart` claims the cwd repo; `Stop` releases. Removes the "agents forget to claim" failure mode.
 - **Liveness reaping** — detect dead owners (pane/pid gone) and free their claims before the TTL.
 - **Generalize claims to resources** — not just directories: a dev-server port, a deploy slot, a shared DB, a rate-limited credential. `bb claim --resource :3000`.
 - **Wait / queue / handoff** — `bb wait <dir>` blocks until free; release can leave a handoff note for whoever's next, instead of `--steal`.

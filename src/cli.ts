@@ -382,9 +382,48 @@ async function cmdHook(argv: string[]): Promise<void> {
   try {
     if (event === "session-start") hookSessionStart(cwd);
     else if (event === "session-end") hookSessionEnd(cwd);
+    else if (event === "prompt") hookPrompt();
   } catch {
     // swallow — never break the session over a coordination hook
   }
+}
+
+/**
+ * UserPromptSubmit feed: inject bulletins posted by OTHER agents since this
+ * agent's last turn, then advance the cursor so each is shown once. Silent when
+ * nothing is new. This is how a mid-session broadcast ("staging DB migrated")
+ * reaches the other agents without anyone running `bb unread`.
+ */
+function hookPrompt(): void {
+  const db = openBoard({ create: false });
+  if (!db) return;
+  const me = agentKey();
+  const rows = unread(db, me);
+  if (rows.length === 0) return; // nothing new — inject nothing
+  setCursor(db, me); // mark delivered
+
+  const lines = [
+    `📋 bulletin-board — ${rows.length} update(s) from other agents since your last turn:`,
+  ];
+  for (const b of rows) {
+    const where =
+      b.scope === "global"
+        ? "global"
+        : `${tilde(b.path)}${b.branch ? ` @ ${b.branch}` : ""}`;
+    const verb = b.kind === "claim" ? "claimed" : "note on";
+    const msg = b.message ? ` — "${b.message}"` : "";
+    lines.push(`  • ${b.display} ${verb} ${where} (${fmtAgo(b.created_at)})${msg}`);
+  }
+  lines.push(`(\`bb list\` for the full board; \`bb fork <name>\` to work alongside a claimed repo)`);
+
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "UserPromptSubmit",
+        additionalContext: lines.join("\n"),
+      },
+    }),
+  );
 }
 
 function hookSessionStart(cwd: string): void {
@@ -480,7 +519,8 @@ USAGE
   bb gc [--days N]         Purge old released/expired rows (default 7d)
   bb whoami                Show your agent id + db path
   bb hook <event>          Internal: Claude Code lifecycle hooks
-                           session-start (claim repo) | session-end (release)
+                           session-start (claim) | session-end (release)
+                           prompt (feed others' new bulletins into context)
 
 ENV
   BB_AGENT   override agent identity (set per-agent for non-tmux runners)
