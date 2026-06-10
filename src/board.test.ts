@@ -5,9 +5,11 @@ import { join } from "path";
 import {
   findConflicts,
   openBoard,
+  ownLiveClaimOn,
   parseDuration,
   pathsOverlap,
   post,
+  refreshClaim,
   release,
   renew,
   setCursor,
@@ -104,6 +106,21 @@ test("unread returns others' new bulletins and respects the cursor", () => {
     agent: "tmux:%9", display: "tmux:%9",
   });
   expect(unread(db, "tmux:%5")).toHaveLength(1);
+  db.close();
+});
+
+test("ownLiveClaimOn + refreshClaim back idempotent claims", () => {
+  const c = claim("tmux:%2", "/repo/a");
+  const db = openBoard()!;
+  expect(ownLiveClaimOn(db, "tmux:%2", "/repo/a")?.id).toBe(c.id);
+  expect(ownLiveClaimOn(db, "tmux:%2", "/repo/b")).toBeNull(); // different dir
+  expect(ownLiveClaimOn(db, "tmux:%9", "/repo/a")).toBeNull(); // different agent
+  const refreshed = refreshClaim(db, c.id, { branch: "feat/x", message: "still here", ttl: 7200 });
+  expect(refreshed.message).toBe("still here");
+  expect(refreshed.branch).toBe("feat/x");
+  expect(refreshed.expires_at).toBeGreaterThanOrEqual(nowSec() + 7100);
+  // still exactly one live claim on that dir (refreshed, not duplicated)
+  expect(findConflicts(db, "/repo/a", "tmux:%9")).toHaveLength(1);
   db.close();
 });
 

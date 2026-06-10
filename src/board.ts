@@ -355,6 +355,35 @@ export function post(db: Database, input: PostInput): Bulletin {
   return row;
 }
 
+/** An agent's own live claim on this exact directory, if any. */
+export function ownLiveClaimOn(
+  db: Database,
+  agent: string,
+  path: string,
+): Bulletin | null {
+  const rows = db
+    .query(
+      `SELECT * FROM bulletins
+       WHERE kind = 'claim' AND scope = 'dir' AND ${LIVE} AND agent = ? AND path = ?
+       ORDER BY created_at DESC LIMIT 1`,
+    )
+    .all(nowSec(), agent, path) as Bulletin[];
+  return rows[0] ?? null;
+}
+
+/** Refresh an existing claim's branch/message and extend its expiry. */
+export function refreshClaim(
+  db: Database,
+  id: number,
+  fields: { branch?: string | null; message?: string | null; ttl: number },
+): Bulletin {
+  return db
+    .query(
+      `UPDATE bulletins SET branch = ?, message = ?, expires_at = ? WHERE id = ? RETURNING *`,
+    )
+    .get(fields.branch ?? null, fields.message ?? null, nowSec() + fields.ttl, id) as Bulletin;
+}
+
 /** Mark live bulletins released. Returns the number released. */
 export function release(
   db: Database,

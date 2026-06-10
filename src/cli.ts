@@ -28,14 +28,17 @@ import {
   dbPath,
   DEFAULT_TTL,
   findConflicts,
+  findGitRoot,
   fmtAgo,
   fmtExpiry,
   gc,
   liveBulletins,
   openBoard,
+  ownLiveClaimOn,
   parseDuration,
   pathsOverlap,
   post,
+  refreshClaim,
   release,
   renew,
   setCursor,
@@ -134,12 +137,20 @@ function cmdClaim(argv: string[]): void {
     }
   }
 
+  const message = (flags.message as string) ?? null;
+  const existing = ownLiveClaimOn(db, me, target);
+  if (existing) {
+    // Idempotent: you already hold this dir — refresh rather than duplicate.
+    const b = refreshClaim(db, existing.id, { branch, message, ttl });
+    console.log(`🔁 Refreshed claim on ${tilde(target)}${branch ? ` @ ${branch}` : ""} (#${b.id}, expires ${fmtExpiry(b.expires_at)})`);
+    return;
+  }
   const b = post(db, {
     kind: "claim",
     scope: "dir",
     path: target,
     branch,
-    message: (flags.message as string) ?? null,
+    message,
     ttl,
     agent: me,
     display: agentDisplay(),
@@ -288,6 +299,80 @@ function cmdUnread(argv: string[]): void {
   printList(rows, "");
 }
 
+/**
+ * Claude Code lifecycle hooks. Wired in settings.json:
+ *   SessionStart → bb hook session-start   (claim this repo for the session)
+ *   SessionEnd   → bb hook session-end      (release it)
+ * Reads the hook payload (with `cwd`) from stdin. Never throws — a hook must
+ * not disrupt the session.
+ */
+async function cmdHook(argv: string[]): Promise<void> {
+  const event = argv[0];
+  let input: Record<string, any> = {};
+  try {
+    const text = await Bun.stdin.text();
+    if (text.trim()) input = JSON.parse(text);
+  } catch {
+    // no / invalid stdin — fall back to process.cwd()
+  }
+  const cwd = typeof input.cwd === "string" ? input.cwd : process.cwd();
+  try {
+    if (event === "session-start") hookSessionStart(cwd);
+    else if (event === "session-end") hookSessionEnd(cwd);
+  } catch {
+    // swallow — never break the session over a coordination hook
+  }
+}
+
+function hookSessionStart(cwd: string): void {
+  const root = findGitRoot(cwd);
+  if (!root) return; // not in a repo — nothing to claim, emit nothing
+  const db = openBoard()!;
+  const me = agentKey();
+  const branch = currentBranch(root);
+  // Generous TTL: SessionEnd releases sooner; the TTL is the crash backstop so
+  // a killed session frees the dir within a workday.
+  const ttl = process.env.BB_SESSION_TTL
+    ? parseDuration(process.env.BB_SESSION_TTL)
+    : 8 * 60 * 60;
+  const existing = ownLiveClaimOn(db, me, root);
+  if (existing) refreshClaim(db, existing.id, { branch, message: "active session", ttl });
+  else
+    post(db, {
+      kind: "claim",
+      scope: "dir",
+      path: root,
+      branch,
+      message: "active session",
+      ttl,
+      agent: me,
+      display: agentDisplay(),
+      pid: agentPid(),
+    });
+
+  const newsCount = unread(db, me).length; // peek; the cursor is not advanced
+  const lines = [
+    `🔒 bulletin-board: claimed ${tilde(root)}${branch ? ` @ ${branch}` : ""} for this session — other agents are warned before they checkout/switch/reset here.`,
+  ];
+  if (newsCount > 0)
+    lines.push(`📋 ${newsCount} board note(s) since you last looked — run \`bb unread\`.`);
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "SessionStart",
+        additionalContext: lines.join("\n"),
+      },
+    }),
+  );
+}
+
+function hookSessionEnd(cwd: string): void {
+  const db = openBoard({ create: false });
+  if (!db) return;
+  const root = findGitRoot(cwd) ?? canonicalDir(cwd, cwd);
+  release(db, { agent: agentKey(), path: root });
+}
+
 function cmdGc(argv: string[]): void {
   const { flags } = parseArgs(argv, { bool: [], value: ["days"], alias: {} });
   const db = openBoard({ create: false });
@@ -328,6 +413,8 @@ USAGE
      -g, --global | -p, --path <dir> | -t, --ttl <dur>
   bb gc [--days N]         Purge old released/expired rows (default 7d)
   bb whoami                Show your agent id + db path
+  bb hook <event>          Internal: Claude Code lifecycle hooks
+                           session-start (claim repo) | session-end (release)
 
 ENV
   BB_AGENT   override agent identity (set per-agent for non-tmux runners)
@@ -345,6 +432,7 @@ try {
     case "list": case undefined: cmdList(rest); break;
     case "unread": case "inbox": cmdUnread(rest); break;
     case "note": cmdNote(rest); break;
+    case "hook": await cmdHook(rest); break;
     case "gc": cmdGc(rest); break;
     case "whoami": cmdWhoami(); break;
     case "help": case "-h": case "--help": console.log(HELP); break;

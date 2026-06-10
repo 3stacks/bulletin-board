@@ -41,6 +41,20 @@ export default definePolicy([
 
 > **Ordering matters — put the gate first.** toolgate returns the *first* non-`next` verdict, so the gate must run **before** any "allow non-destructive bash/git" policy, or that policy will greenlight `git switch`/`checkout` (it doesn't consider them destructive) before the gate can ask. toolgate also loads `toolgate.config.local.ts` **before** `toolgate.config.ts`, and inner directories before outer ones. So place the gate at the **top of the earliest-loaded config** on the path from your repos up to `$HOME` — in practice, the first entry of your `toolgate.config.local.ts`. Verify with `toolgate test --why Bash '{"command":"git switch x"}'`: the deciding policy should be `Guard claimed directories`, not an allow policy. Set `BB_DEBUG=1` to trace the gate's decision.
 
+### Auto-claim per session (optional)
+
+Wire the lifecycle hooks so each Claude Code instance claims its repo automatically — no need to remember `bb claim`:
+
+```jsonc
+// ~/.claude/settings.json
+"hooks": {
+  "SessionStart": [{ "hooks": [{ "type": "command", "command": "bb hook session-start" }] }],
+  "SessionEnd":   [{ "hooks": [{ "type": "command", "command": "bb hook session-end" }] }]
+}
+```
+
+`session-start` claims the repo at the session's cwd (8h TTL, idempotent — resume/compact refresh rather than duplicate) and injects a one-line confirmation plus any unread count into context. `session-end` releases it; the TTL is the crash backstop. Non-repo directories are skipped. Identity is shared with the gate via `$TMUX_PANE`/`$BB_AGENT`, so a session never prompts on its own claim.
+
 ## Use
 
 ```bash
