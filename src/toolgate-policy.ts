@@ -112,6 +112,8 @@ export function makeDirectoryClaimPolicy(
         if (!command) return deps.next();
 
         const op = parseGitOp(command, destructive);
+        if (process.env.BB_DEBUG)
+          console.error(`[bb gate] tool=${call.tool} cmd=${JSON.stringify(command)} op=${JSON.stringify(op)}`);
         if (!op) return deps.next();
 
         const cwd = call.context?.cwd || process.cwd();
@@ -122,11 +124,16 @@ export function makeDirectoryClaimPolicy(
 
         const conflicts = findConflicts(db, target, agentKey());
         db.close();
+        if (process.env.BB_DEBUG)
+          console.error(
+            `[bb gate] target=${target} self=${agentKey()} conflicts=${conflicts.length}`,
+          );
         if (conflicts.length === 0) return deps.next();
 
         return deps.ask(renderConflict(target, conflicts));
-      } catch {
+      } catch (err) {
         // Fail open — a coordination tool must never wedge the agent.
+        if (process.env.BB_DEBUG) console.error("[bb gate] error:", err);
         return deps.next();
       }
     },

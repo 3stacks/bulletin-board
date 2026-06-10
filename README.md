@@ -26,7 +26,7 @@ bun install
 bun link            # puts `bb` on PATH (~/.bun/bin/bb)
 ```
 
-Wire the gate into your `toolgate.config.ts` (verdict helpers are injected, so this package never imports toolgate):
+Wire the gate into your toolgate config (verdict helpers are injected, so this package never imports toolgate):
 
 ```ts
 import { definePolicy } from "@brycehanscomb/toolgate";
@@ -34,10 +34,12 @@ import { ask, next } from "@brycehanscomb/toolgate/verdicts";
 import { makeDirectoryClaimPolicy } from "bulletin-board/toolgate";
 
 export default definePolicy([
+  makeDirectoryClaimPolicy({ ask, next }), // FIRST — see ordering note
   ...yourPolicies,
-  makeDirectoryClaimPolicy({ ask, next }),
 ]);
 ```
+
+> **Ordering matters — put the gate first.** toolgate returns the *first* non-`next` verdict, so the gate must run **before** any "allow non-destructive bash/git" policy, or that policy will greenlight `git switch`/`checkout` (it doesn't consider them destructive) before the gate can ask. toolgate also loads `toolgate.config.local.ts` **before** `toolgate.config.ts`, and inner directories before outer ones. So place the gate at the **top of the earliest-loaded config** on the path from your repos up to `$HOME` — in practice, the first entry of your `toolgate.config.local.ts`. Verify with `toolgate test --why Bash '{"command":"git switch x"}'`: the deciding policy should be `Guard claimed directories`, not an allow policy. Set `BB_DEBUG=1` to trace the gate's decision.
 
 ## Use
 
