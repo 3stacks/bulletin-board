@@ -1,0 +1,20 @@
+{
+  "name": "bulletin-board",
+  "version": "0.1.0",
+  "description": "A local bulletin board so concurrent agents can claim working directories and announce intent. A toolgate sidecar.",
+  "type": "module",
+  "bin": {
+    "bb": "./src/cli.ts"
+  },
+  "exports": {
+    ".": "./src/board.ts",
+    "./toolgate": "./src/toolgate-policy.ts"
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "bun-types": "latest"
+  },
+  "keywords": ["claude-code", "toolgate", "agents", "coordination", "lock", "bulletin-board"]
+}
