@@ -2,7 +2,7 @@
 
 A local bulletin board so concurrent agents can **claim working directories** and **announce intent** before they step on each other — e.g. two Claude Code instances checking out branches in the same repo.
 
-It's a **toolgate sidecar**: drop in one policy and a destructive git op in a directory another live agent has claimed will prompt for confirmation instead of silently clobbering their working tree.
+It's a sidecar for **[toolgate](https://github.com/brycehans/toolgate)**: drop in one policy and a destructive git op in a directory another live agent has claimed will prompt for confirmation instead of silently clobbering their working tree.
 
 ```
 $ git switch main      # in a repo another agent is mid-edit on
@@ -30,9 +30,10 @@ bun install
 bun link            # puts `bb` on PATH (~/.bun/bin/bb)
 ```
 
-Wire the gate into your toolgate config (verdict helpers are injected, so this package never imports toolgate):
+Wire the gate into your [toolgate](https://github.com/brycehans/toolgate) config (verdict helpers are injected, so this package never imports toolgate):
 
 ```ts
+// toolgate: github.com/brycehans/toolgate — `bun add github:brycehans/toolgate`
 import { definePolicy } from "@brycehanscomb/toolgate";
 import { ask, next } from "@brycehanscomb/toolgate/verdicts";
 import { makeDirectoryClaimPolicy } from "bulletin-board/toolgate";
