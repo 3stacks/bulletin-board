@@ -17,14 +17,20 @@ import { homedir, hostname } from "os";
 import { dirname, join, resolve } from "path";
 
 export type Kind = "claim" | "note";
-export type Scope = "dir" | "global";
+export type Scope = "dir" | "resource" | "global";
 
 export interface Bulletin {
   id: number;
   kind: Kind;
   scope: Scope;
-  /** Canonical absolute directory (git toplevel when inside a repo). null for global. */
+  /** Canonical absolute directory (git toplevel when inside a repo). null for global / resource. */
   path: string | null;
+  /**
+   * Canonical resource key for scope === "resource" (e.g. "docker:kohub-api",
+   * "port:3000"). null for dir / global. Resources conflict on an exact key
+   * match, unlike directories which conflict on path overlap.
+   */
+  resource: string | null;
   branch: string | null;
   /** Stable identity key used for matching/self-exclusion (e.g. "tmux:%2"). */
   agent: string;
@@ -78,6 +84,7 @@ function migrate(db: Database): void {
       kind        TEXT NOT NULL,
       scope       TEXT NOT NULL,
       path        TEXT,
+      resource    TEXT,
       branch      TEXT,
       agent       TEXT NOT NULL,
       display     TEXT NOT NULL,
@@ -98,6 +105,22 @@ function migrate(db: Database): void {
       seen_id INTEGER NOT NULL
     );
   `);
+
+  // Boards created before resource claims existed lack the `resource` column;
+  // add it in place. Guarded so a concurrent bb process losing the ALTER race
+  // (duplicate-column error) doesn't wedge — the column ends up present either
+  // way, and the index create is created only once the column exists.
+  const cols = db.query("PRAGMA table_info(bulletins)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === "resource")) {
+    try {
+      db.exec("ALTER TABLE bulletins ADD COLUMN resource TEXT");
+    } catch {
+      // lost the race to another bb process — the column is now present.
+    }
+  }
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_bulletins_resource ON bulletins(resource)",
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +239,41 @@ export function pathsOverlap(a: string, b: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Resource helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Canonicalise a resource identifier into a `<type>:<id>` key used for exact
+ * conflict matching (resources don't "overlap" the way directories do — two
+ * claims conflict iff their keys are identical).
+ *
+ * The part before the first colon is the type, lower-cased (e.g. "docker",
+ * "port", "deploy"); the remainder is the id, kept verbatim (container names
+ * and the like can be case-sensitive). With no colon the type defaults to
+ * "resource". So:
+ *   "docker:kohub-api" → "docker:kohub-api"
+ *   "kohub-api"        → "resource:kohub-api"
+ *   "PORT : 3000"      → "port:3000"
+ */
+export function canonicalResource(input: string): string {
+  const raw = input.trim();
+  if (!raw) throw new Error("resource is empty");
+  const i = raw.indexOf(":");
+  const type = (i === -1 ? "" : raw.slice(0, i)).trim().toLowerCase() || "resource";
+  const id = (i === -1 ? raw : raw.slice(i + 1)).trim();
+  if (!id) throw new Error(`resource id is empty in "${input}"`);
+  return `${type}:${id}`;
+}
+
+/** Split a canonical resource key back into its type and id (for display). */
+export function splitResource(key: string): { type: string; id: string } {
+  const i = key.indexOf(":");
+  return i === -1
+    ? { type: "resource", id: key }
+    : { type: key.slice(0, i), id: key.slice(i + 1) };
+}
+
+// ---------------------------------------------------------------------------
 // Queries
 // ---------------------------------------------------------------------------
 
@@ -265,6 +323,26 @@ export function findConflicts(
     )
     .all(nowSec(), selfAgent) as Bulletin[];
   return rows.filter((b) => b.path != null && pathsOverlap(b.path, path));
+}
+
+/**
+ * The resource analog of {@link findConflicts}: live CLAIMS on the exact
+ * resource `key` (e.g. "docker:kohub-api") held by an agent OTHER than
+ * `selfAgent`. Empty array → the caller is free to use that resource.
+ */
+export function findResourceConflicts(
+  db: Database,
+  key: string,
+  selfAgent: string,
+): Bulletin[] {
+  return db
+    .query(
+      `SELECT * FROM bulletins
+       WHERE kind = 'claim' AND scope = 'resource' AND ${LIVE}
+         AND agent != ? AND resource = ?
+       ORDER BY created_at ASC`,
+    )
+    .all(nowSec(), selfAgent, key) as Bulletin[];
 }
 
 /** Live bulletins owned by `agent`. */
@@ -321,6 +399,8 @@ export interface PostInput {
   kind: Kind;
   scope: Scope;
   path?: string | null;
+  /** Canonical resource key for scope === "resource" (e.g. "docker:kohub-api"). */
+  resource?: string | null;
   branch?: string | null;
   message?: string | null;
   ttl: number; // seconds
@@ -335,14 +415,15 @@ export function post(db: Database, input: PostInput): Bulletin {
   const row = db
     .query(
       `INSERT INTO bulletins
-         (kind, scope, path, branch, agent, display, host, pid, message, created_at, expires_at, released_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+         (kind, scope, path, resource, branch, agent, display, host, pid, message, created_at, expires_at, released_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
        RETURNING *`,
     )
     .get(
       input.kind,
       input.scope,
       input.path ?? null,
+      input.resource ?? null,
       input.branch ?? null,
       input.agent,
       input.display,
@@ -371,6 +452,22 @@ export function ownLiveClaimOn(
   return rows[0] ?? null;
 }
 
+/** An agent's own live claim on this exact resource key, if any. */
+export function ownLiveResourceClaim(
+  db: Database,
+  agent: string,
+  key: string,
+): Bulletin | null {
+  const rows = db
+    .query(
+      `SELECT * FROM bulletins
+       WHERE kind = 'claim' AND scope = 'resource' AND ${LIVE} AND agent = ? AND resource = ?
+       ORDER BY created_at DESC LIMIT 1`,
+    )
+    .all(nowSec(), agent, key) as Bulletin[];
+  return rows[0] ?? null;
+}
+
 /** Refresh an existing claim's branch/message and extend its expiry. */
 export function refreshClaim(
   db: Database,
@@ -387,7 +484,7 @@ export function refreshClaim(
 /** Mark live bulletins released. Returns the number released. */
 export function release(
   db: Database,
-  filter: { id?: number; agent?: string; path?: string },
+  filter: { id?: number; agent?: string; path?: string; resource?: string },
 ): number {
   const now = nowSec();
   if (filter.id != null) {
@@ -397,13 +494,15 @@ export function release(
     );
     return r.changes;
   }
-  // Release the agent's own live rows, optionally narrowed to a path overlap.
+  // Release the agent's own live rows, optionally narrowed to a path overlap or
+  // an exact resource key. With neither narrowing, releases all of them.
   const rows = db
     .query(`SELECT * FROM bulletins WHERE ${LIVE} AND agent = ?`)
     .all(now, filter.agent ?? "") as Bulletin[];
   let n = 0;
   const stmt = db.query(`UPDATE bulletins SET released_at = ? WHERE id = ?`);
   for (const b of rows) {
+    if (filter.resource && b.resource !== filter.resource) continue;
     if (filter.path && !(b.path != null && pathsOverlap(b.path, filter.path)))
       continue;
     stmt.run(now, b.id);
@@ -425,10 +524,23 @@ export function stealOverlapping(
   return victims;
 }
 
+/** Forcibly release others' live claims on an exact resource key (--steal). */
+export function stealResource(
+  db: Database,
+  key: string,
+  selfAgent: string,
+): Bulletin[] {
+  const victims = findResourceConflicts(db, key, selfAgent);
+  const now = nowSec();
+  const stmt = db.query(`UPDATE bulletins SET released_at = ? WHERE id = ?`);
+  for (const v of victims) stmt.run(now, v.id);
+  return victims;
+}
+
 /** Extend a bulletin's expiry to now + ttl. Returns updated rows. */
 export function renew(
   db: Database,
-  filter: { id?: number; agent: string; path?: string },
+  filter: { id?: number; agent: string; path?: string; resource?: string },
   ttl: number,
 ): Bulletin[] {
   const now = nowSec();
@@ -443,7 +555,9 @@ export function renew(
       .query(`SELECT * FROM bulletins WHERE ${LIVE} AND agent = ?`)
       .all(now, filter.agent) as Bulletin[];
     targets = rows.filter(
-      (b) => !filter.path || (b.path != null && pathsOverlap(b.path, filter.path)),
+      (b) =>
+        (filter.resource ? b.resource === filter.resource : true) &&
+        (!filter.path || (b.path != null && pathsOverlap(b.path, filter.path))),
     );
   }
   const stmt = db.query(
