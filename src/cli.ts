@@ -27,17 +27,20 @@ import {
   bulletinsByAgent,
   bulletinsForPath,
   canonicalDir,
+  canonicalResource,
   currentBranch,
   dbPath,
   DEFAULT_TTL,
   findConflicts,
   findGitRoot,
+  findResourceConflicts,
   fmtAgo,
   fmtExpiry,
   gc,
   liveBulletins,
   openBoard,
   ownLiveClaimOn,
+  ownLiveResourceClaim,
   parseDuration,
   pathsOverlap,
   post,
@@ -46,6 +49,7 @@ import {
   renew,
   setCursor,
   stealOverlapping,
+  stealResource,
   unread,
   type Bulletin,
 } from "./board";
@@ -90,13 +94,20 @@ function fail(msg: string): never {
 
 function icon(b: Bulletin): string {
   if (b.scope === "global") return "🌐";
-  return b.kind === "claim" ? "🔒" : "📌";
+  if (b.kind === "note") return "📌";
+  return b.scope === "resource" ? "📦" : "🔒";
+}
+
+/** Where a bulletin applies: a dir (+branch), a resource key, or "global". */
+function bulletinWhere(b: Bulletin): string {
+  if (b.scope === "global") return "global";
+  if (b.scope === "resource") return b.resource ?? "resource";
+  return `${tilde(b.path)}${b.branch ? ` @ ${b.branch}` : ""}`;
 }
 
 function renderBulletin(b: Bulletin, opts: { mineKey?: string } = {}): string {
   const mine = opts.mineKey && b.agent === opts.mineKey ? " (you)" : "";
-  const where =
-    b.scope === "global" ? "global" : `${tilde(b.path)}${b.branch ? ` @ ${b.branch}` : ""}`;
+  const where = bulletinWhere(b);
   const head = `${icon(b)} #${b.id} ${where}`;
   const meta = `   ${b.display}${mine} · ${fmtAgo(b.created_at)} · expires ${fmtExpiry(b.expires_at)}`;
   const note = b.message ? `\n   "${b.message}"` : "";
@@ -117,15 +128,52 @@ function printList(bulletins: Bulletin[], emptyMsg: string): void {
 function cmdClaim(argv: string[]): void {
   const { positionals, flags } = parseArgs(argv, {
     bool: ["steal"],
-    value: ["branch", "ttl", "message"],
-    alias: { b: "branch", t: "ttl", m: "message" },
+    value: ["branch", "ttl", "message", "resource"],
+    alias: { b: "branch", t: "ttl", m: "message", r: "resource" },
   });
   const db = openBoard()!;
-  const target = canonicalDir(positionals[0], process.cwd());
   const ttl = flags.ttl ? parseDuration(String(flags.ttl)) : DEFAULT_TTL.claim;
+  const message = (flags.message as string) ?? null;
+  const me = agentKey();
+
+  // Resource claim (docker container, port, deploy slot, …): exact-key, no path.
+  if (flags.resource) {
+    const key = canonicalResource(String(flags.resource));
+    if (flags.steal) {
+      const stolen = stealResource(db, key, me);
+      if (stolen.length)
+        console.log(`Stole ${stolen.length} claim(s): ${stolen.map((s) => s.display).join(", ")}`);
+    } else {
+      const conflicts = findResourceConflicts(db, key, me);
+      if (conflicts.length) {
+        console.log("⚠  Already claimed by another agent:");
+        printList(conflicts, "");
+        console.log("\nClaiming anyway (both claims coexist). Use --steal to release theirs.");
+      }
+    }
+    const existingRes = ownLiveResourceClaim(db, me, key);
+    if (existingRes) {
+      const b = refreshClaim(db, existingRes.id, { branch: null, message, ttl });
+      console.log(`🔁 Refreshed claim on ${key} (#${b.id}, expires ${fmtExpiry(b.expires_at)})`);
+      return;
+    }
+    const b = post(db, {
+      kind: "claim",
+      scope: "resource",
+      resource: key,
+      message,
+      ttl,
+      agent: me,
+      display: agentDisplay(),
+      pid: agentPid(),
+    });
+    console.log(`📦 Claimed ${key} (#${b.id}, expires ${fmtExpiry(b.expires_at)})`);
+    return;
+  }
+
+  const target = canonicalDir(positionals[0], process.cwd());
   const branch =
     (flags.branch as string) ?? currentBranch(target) ?? null;
-  const me = agentKey();
 
   if (flags.steal) {
     const stolen = stealOverlapping(db, target, me);
@@ -140,7 +188,6 @@ function cmdClaim(argv: string[]): void {
     }
   }
 
-  const message = (flags.message as string) ?? null;
   const existing = ownLiveClaimOn(db, me, target);
   if (existing) {
     // Idempotent: you already hold this dir — refresh rather than duplicate.
@@ -165,14 +212,16 @@ function cmdClaim(argv: string[]): void {
 function cmdRelease(argv: string[]): void {
   const { positionals, flags } = parseArgs(argv, {
     bool: ["all"],
-    value: ["id"],
-    alias: {},
+    value: ["id", "resource"],
+    alias: { r: "resource" },
   });
   const db = openBoard()!;
   const me = agentKey();
   let n: number;
   if (flags.id != null) n = release(db, { id: parseInt(String(flags.id), 10) });
   else if (flags.all) n = release(db, { agent: me });
+  else if (flags.resource)
+    n = release(db, { agent: me, resource: canonicalResource(String(flags.resource)) });
   else n = release(db, { agent: me, path: canonicalDir(positionals[0], process.cwd()) });
   console.log(n ? `Released ${n} bulletin(s).` : "Nothing to release.");
 }
@@ -180,8 +229,8 @@ function cmdRelease(argv: string[]): void {
 function cmdRenew(argv: string[]): void {
   const { positionals, flags } = parseArgs(argv, {
     bool: [],
-    value: ["id", "ttl"],
-    alias: { t: "ttl" },
+    value: ["id", "ttl", "resource"],
+    alias: { t: "ttl", r: "resource" },
   });
   const db = openBoard()!;
   const ttl = flags.ttl ? parseDuration(String(flags.ttl)) : DEFAULT_TTL.claim;
@@ -189,20 +238,52 @@ function cmdRenew(argv: string[]): void {
   const updated =
     flags.id != null
       ? renew(db, { id: parseInt(String(flags.id), 10), agent: me }, ttl)
-      : renew(db, { agent: me, path: canonicalDir(positionals[0], process.cwd()) }, ttl);
+      : flags.resource
+        ? renew(db, { agent: me, resource: canonicalResource(String(flags.resource)) }, ttl)
+        : renew(db, { agent: me, path: canonicalDir(positionals[0], process.cwd()) }, ttl);
   if (!updated.length) {
     console.log("Nothing to renew.");
     return;
   }
   for (const b of updated)
-    console.log(`Renewed #${b.id} ${tilde(b.path)} → expires ${fmtExpiry(b.expires_at)}`);
+    console.log(`Renewed #${b.id} ${bulletinWhere(b)} → expires ${fmtExpiry(b.expires_at)}`);
 }
 
 function cmdCheck(argv: string[]): void {
-  const { positionals } = parseArgs(argv, { bool: [], value: [], alias: {} });
+  const { positionals, flags } = parseArgs(argv, {
+    bool: [],
+    value: ["resource"],
+    alias: { r: "resource" },
+  });
+  const me = agentKey();
+
+  // Resource check: exact-key conflict, same exit-3 contract as a dir check.
+  if (flags.resource) {
+    const key = canonicalResource(String(flags.resource));
+    const db = openBoard({ create: false });
+    if (!db) {
+      console.log(`✓ clear — ${key}`);
+      process.exit(0);
+    }
+    const here = liveBulletins(db).filter(
+      (b) => b.scope === "resource" && b.resource === key,
+    );
+    const conflicts = findResourceConflicts(db, key, me);
+    if (here.length) {
+      console.log(`Bulletins on ${key}:\n`);
+      printList(here, "");
+      console.log("");
+    }
+    if (conflicts.length) {
+      console.log(`✗ conflict — ${conflicts.length} live claim(s) by another agent on ${key}.`);
+      process.exit(3);
+    }
+    console.log(`✓ clear — no conflicting claims on ${key}.`);
+    process.exit(0);
+  }
+
   const db = openBoard({ create: false });
   const target = canonicalDir(positionals[0], process.cwd());
-  const me = agentKey();
   if (!db) {
     console.log(`✓ clear — ${tilde(target)}`);
     process.exit(0);
@@ -224,7 +305,7 @@ function cmdCheck(argv: string[]): void {
 
 function cmdList(argv: string[]): void {
   const { flags } = parseArgs(argv, {
-    bool: ["global", "mine", "all", "json"],
+    bool: ["global", "mine", "all", "json", "resources"],
     value: ["dir"],
     alias: { g: "global" },
   });
@@ -236,6 +317,7 @@ function cmdList(argv: string[]): void {
   }
   let rows = flags.all ? allBulletins(db) : liveBulletins(db);
   if (flags.global) rows = rows.filter((b) => b.scope === "global");
+  if (flags.resources) rows = rows.filter((b) => b.scope === "resource");
   if (flags.mine) rows = rows.filter((b) => b.agent === agentKey());
   if (flags.dir) {
     const d = canonicalDir(String(flags.dir), process.cwd());
@@ -406,13 +488,9 @@ function hookPrompt(): void {
     `📋 bulletin-board — ${rows.length} update(s) from other agents since your last turn:`,
   ];
   for (const b of rows) {
-    const where =
-      b.scope === "global"
-        ? "global"
-        : `${tilde(b.path)}${b.branch ? ` @ ${b.branch}` : ""}`;
     const verb = b.kind === "claim" ? "claimed" : "note on";
     const msg = b.message ? ` — "${b.message}"` : "";
-    lines.push(`  • ${b.display} ${verb} ${where} (${fmtAgo(b.created_at)})${msg}`);
+    lines.push(`  • ${b.display} ${verb} ${bulletinWhere(b)} (${fmtAgo(b.created_at)})${msg}`);
   }
   lines.push(`(\`bb list\` for the full board; \`bb fork <name>\` to work alongside a claimed repo)`);
 
@@ -498,17 +576,19 @@ const HELP = `bb — bulletin board for coordinating concurrent agents
 
 USAGE
   bb claim [path]          Claim a directory (default: cwd → git root)
+     -r, --resource <key>    Claim a resource instead, e.g. docker:kohub-api
      -b, --branch <name>     Branch (default: current branch)
      -t, --ttl <dur>         TTL, e.g. 30m 2h 1d 1w (default: 2h)
      -m, --message <text>    What you're doing
      --steal                 Release others' overlapping claims first
   bb release [path]        Release your claim(s) here (default: cwd)
-     --id <n> | --all
+     --id <n> | --all | -r, --resource <key>
   bb renew [path]          Extend your claim's TTL (default: cwd)
-     --id <n> | -t, --ttl <dur>
+     --id <n> | -t, --ttl <dur> | -r, --resource <key>
   bb check [path]          Show bulletins here; exit 3 if a conflict
+     -r, --resource <key>    Check a resource instead
   bb list                  List live bulletins
-     --dir <p> | --global | --mine | --all | --json
+     --dir <p> | --global | --resources | --mine | --all | --json
   bb unread                Bulletins from other agents since you last looked
      --peek (don't advance cursor) | --quiet | --json
   bb note <text>           Post a note
@@ -521,6 +601,15 @@ USAGE
   bb hook <event>          Internal: Claude Code lifecycle hooks
                            session-start (claim) | session-end (release)
                            prompt (feed others' new bulletins into context)
+
+RESOURCES
+  Claim things other than directories — a docker container, a dev-server port,
+  a deploy slot — with a <type>:<id> key (omit the type to default to "resource"):
+     bb claim -r docker:kohub-api -m "running migrations"
+     bb claim -r port:5173
+  Resources conflict on an exact key match (not path overlap). With the toolgate
+  gate wired, a destructive docker op (stop/kill/rm/restart, or compose down) on
+  a container/project another live agent holds will prompt before clobbering it.
 
 ENV
   BB_AGENT   override agent identity (set per-agent for non-tmux runners)
