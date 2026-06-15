@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { rmSync } from "fs";
+import { execSync } from "child_process";
+import { mkdirSync, mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
@@ -16,6 +17,7 @@ import {
   refreshClaim,
   release,
   renew,
+  sameRepoScope,
   setCursor,
   unread,
   nowSec,
@@ -76,6 +78,15 @@ test("pathsOverlap respects segment boundaries", () => {
   expect(pathsOverlap("/a/b", "/x/y")).toBe(false);
 });
 
+test("sameRepoScope matches by repo identity, not containment", () => {
+  expect(sameRepoScope("/a/b", "/a/b")).toBe(true);
+  expect(sameRepoScope("/a/b/", "/a/b")).toBe(true); // trailing slash normalised
+  expect(sameRepoScope("/a/b", "/a/b/c")).toBe(false); // nested repo ≠ same scope
+  expect(sameRepoScope("/a/b/c", "/a/b")).toBe(false); // ancestor ≠ same scope
+  expect(sameRepoScope("/a/foo", "/a/foobar")).toBe(false);
+  expect(sameRepoScope("/a/b", "/x/y")).toBe(false);
+});
+
 test("parseDuration handles units and bare seconds", () => {
   expect(parseDuration("30")).toBe(30);
   expect(parseDuration("30m")).toBe(1800);
@@ -85,12 +96,15 @@ test("parseDuration handles units and bare seconds", () => {
   expect(() => parseDuration("soon")).toThrow();
 });
 
-test("a claim conflicts for a different agent but not the owner", () => {
+test("a claim conflicts by repo identity for a different agent, not the owner", () => {
   claim("tmux:%2", "/repo/ko-sites");
   const db = openBoard()!;
   expect(findConflicts(db, "/repo/ko-sites", "tmux:%5")).toHaveLength(1);
   expect(findConflicts(db, "/repo/ko-sites", "tmux:%2")).toHaveLength(0); // self
-  expect(findConflicts(db, "/repo/ko-sites/app", "tmux:%5")).toHaveLength(1); // child dir
+  // Callers pass canonical git toplevels, so a nested repo is its own scope: a
+  // claim on the parent must NOT block it (the nested-repo fix). A deeper path
+  // within the SAME repo would have canonicalised to /repo/ko-sites upstream.
+  expect(findConflicts(db, "/repo/ko-sites/Sites/kohub-api", "tmux:%5")).toHaveLength(0);
   expect(findConflicts(db, "/repo/other", "tmux:%5")).toHaveLength(0);
   db.close();
 });
@@ -202,6 +216,19 @@ test("releasing a resource leaves the agent's dir claims alone", () => {
   db.close();
 });
 
+test("path-targeted release matches the exact repo, not nested repos", () => {
+  const me = "tmux:%2";
+  claim(me, "/repo/parent");
+  claim(me, "/repo/parent/Sites/child"); // a nested repo held by the same agent
+  const db = openBoard()!;
+  // Releasing the parent dir releases only the parent claim; the nested-repo
+  // claim survives (a claim is scoped to one repo, not a subtree).
+  expect(release(db, { agent: me, path: "/repo/parent" })).toBe(1);
+  expect(findConflicts(db, "/repo/parent", "tmux:%9")).toHaveLength(0);
+  expect(findConflicts(db, "/repo/parent/Sites/child", "tmux:%9")).toHaveLength(1);
+  db.close();
+});
+
 test("parseDockerOp detects container ops and extracts names", () => {
   const cont = ["stop", "kill", "rm", "restart", "pause", "unpause"];
   const comp = ["down", "stop", "restart", "kill", "rm"];
@@ -290,4 +317,42 @@ test("gate asks before `docker compose down` in a claimed project dir", async ()
   expect(await gateVerdict("docker compose down", "tmux:%me", dir)).toBe("ask");
   expect(await gateVerdict("docker compose down", "tmux:%owner", dir)).toBe("next"); // self
   expect(await gateVerdict("docker compose up -d", "tmux:%me", dir)).toBe("next"); // up not gated
+});
+
+test("gate scopes a dir claim to its repo — nested repos stay unblocked", async () => {
+  // Real nested git repos: parent/ is a repo, parent/Sites/child/ is its own
+  // repo (mirrors ~/ko-work with ~/ko-work/Sites/* nested inside it).
+  const base = mkdtempSync(join(tmpdir(), "bb-nested-"));
+  const parent = join(base, "parent");
+  const child = join(parent, "Sites", "child");
+  mkdirSync(child, { recursive: true });
+  const git = (cwd: string, args: string) =>
+    execSync(`git ${args}`, { cwd, stdio: ["pipe", "pipe", "pipe"] });
+  for (const dir of [parent, child]) {
+    git(dir, "init -q");
+    git(dir, "config user.email t@t.t");
+    git(dir, "config user.name t");
+    git(dir, "commit -q --allow-empty -m init");
+  }
+
+  // Owner claims the PARENT repo at its canonical toplevel.
+  const db = openBoard()!;
+  post(db, {
+    kind: "claim", scope: "dir", path: canonicalDir(parent, parent),
+    branch: "main", ttl: 3600, agent: "tmux:%owner", display: "tmux:%owner",
+  });
+  db.close();
+
+  try {
+    // Destructive git op in the PARENT repo → gated for another agent.
+    expect(await gateVerdict("git switch -c x", "tmux:%me", parent)).toBe("ask");
+    // Same op run from a deep subdir of the SAME repo → still gated.
+    expect(await gateVerdict("git reset --hard", "tmux:%me", parent)).toBe("ask");
+    // Same op in the NESTED child repo → allowed (independent unit of work).
+    expect(await gateVerdict("git switch -c x", "tmux:%me", child)).toBe("next");
+    // git -C pointing into the nested repo → also allowed.
+    expect(await gateVerdict(`git -C ${child} reset --hard`, "tmux:%me", parent)).toBe("next");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });

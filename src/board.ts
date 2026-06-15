@@ -228,14 +228,40 @@ export function canonicalDir(input: string | undefined, cwd: string): string {
 }
 
 /**
- * Two directories conflict when one contains the other (or they are equal).
- * Uses path-segment boundaries so /a/foo does not "overlap" /a/foobar.
+ * Whether one directory contains the other (or they are equal). Uses
+ * path-segment boundaries so /a/foo does not "overlap" /a/foobar.
+ *
+ * This is CONTAINMENT, and it is the right "blast radius" only for
+ * informational / self-management queries — "what is going on in this subtree"
+ * ({@link bulletinsForPath}, `bb list --dir`) and "release/renew my own claims
+ * under here". It must NOT be used for cross-agent arbitration: see
+ * {@link sameRepoScope} for why a parent claim must not block nested repos.
  */
 export function pathsOverlap(a: string, b: string): boolean {
   if (a === b) return true;
   const aa = a.endsWith("/") ? a : a + "/";
   const bb = b.endsWith("/") ? b : b + "/";
   return aa.startsWith(bb) || bb.startsWith(aa);
+}
+
+/**
+ * Whether two CANONICAL directories (git toplevel — see {@link canonicalDir})
+ * name the same claim scope. A directory claim is scoped to exactly one
+ * repository, so this is path EQUALITY, not containment.
+ *
+ * This is the distinction that stops a claim on a parent directory from locking
+ * the independent repos nested beneath it. `~/ko-work` and
+ * `~/ko-work/Sites/kohub-api` are different git toplevels (Sites/* are their own
+ * repos), hence different scopes — so a claim on the parent never conflicts with
+ * work in a nested repo, and vice-versa. Because both inputs are already
+ * canonicalised, a deeper path *within the same repo* has already collapsed to
+ * that repo's toplevel and still matches.
+ *
+ * Trailing slashes are normalised so a stray "/repo/" still matches "/repo".
+ */
+export function sameRepoScope(a: string, b: string): boolean {
+  const strip = (p: string) => (p.length > 1 && p.endsWith("/") ? p.slice(0, -1) : p);
+  return strip(a) === strip(b);
 }
 
 // ---------------------------------------------------------------------------
@@ -306,9 +332,16 @@ export function bulletinsForPath(db: Database, path: string): Bulletin[] {
 }
 
 /**
- * The core arbitration query: live CLAIMS on a directory overlapping `path`
- * that are held by an agent OTHER than `selfAgent`. An empty array means the
- * caller is free to operate in `path`.
+ * The core arbitration query: live CLAIMS on the SAME repository as `path` that
+ * are held by an agent OTHER than `selfAgent`. An empty array means the caller
+ * is free to operate in `path`.
+ *
+ * `path` is expected canonical (git toplevel — see {@link canonicalDir}), and
+ * stored claim paths are too, so matching is repo identity via
+ * {@link sameRepoScope}, NOT containment. This is deliberate: a repo nested
+ * under a claimed directory (e.g. ~/ko-work/Sites/kohub-api beneath a claim on
+ * ~/ko-work) is its own toplevel and a separate unit of work, so an ancestor's
+ * claim must not block it.
  */
 export function findConflicts(
   db: Database,
@@ -322,7 +355,7 @@ export function findConflicts(
        ORDER BY created_at ASC`,
     )
     .all(nowSec(), selfAgent) as Bulletin[];
-  return rows.filter((b) => b.path != null && pathsOverlap(b.path, path));
+  return rows.filter((b) => b.path != null && sameRepoScope(b.path, path));
 }
 
 /**
@@ -494,8 +527,10 @@ export function release(
     );
     return r.changes;
   }
-  // Release the agent's own live rows, optionally narrowed to a path overlap or
-  // an exact resource key. With neither narrowing, releases all of them.
+  // Release the agent's own live rows, optionally narrowed to a specific repo
+  // (path) or an exact resource key. With neither narrowing, releases all of
+  // them. The path narrowing is repo identity (a claim is scoped to one repo),
+  // so releasing a parent dir does not also release claims on nested repos.
   const rows = db
     .query(`SELECT * FROM bulletins WHERE ${LIVE} AND agent = ?`)
     .all(now, filter.agent ?? "") as Bulletin[];
@@ -503,7 +538,7 @@ export function release(
   const stmt = db.query(`UPDATE bulletins SET released_at = ? WHERE id = ?`);
   for (const b of rows) {
     if (filter.resource && b.resource !== filter.resource) continue;
-    if (filter.path && !(b.path != null && pathsOverlap(b.path, filter.path)))
+    if (filter.path && !(b.path != null && sameRepoScope(b.path, filter.path)))
       continue;
     stmt.run(now, b.id);
     n++;
@@ -511,7 +546,7 @@ export function release(
   return n;
 }
 
-/** Forcibly release others' live claims overlapping a path (the --steal path). */
+/** Forcibly release others' live claims on the same repo as `path` (--steal). */
 export function stealOverlapping(
   db: Database,
   path: string,
@@ -557,7 +592,7 @@ export function renew(
     targets = rows.filter(
       (b) =>
         (filter.resource ? b.resource === filter.resource : true) &&
-        (!filter.path || (b.path != null && pathsOverlap(b.path, filter.path))),
+        (!filter.path || (b.path != null && sameRepoScope(b.path, filter.path))),
     );
   }
   const stmt = db.query(

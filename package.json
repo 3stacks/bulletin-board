@@ -1,6 +1,6 @@
 {
   "name": "bulletin-board",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A local bulletin board so concurrent agents can claim working directories and resources (docker containers, ports, deploy slots) and announce intent. A toolgate sidecar.",
   "license": "MIT",
   "type": "module",
