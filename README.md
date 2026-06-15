@@ -109,7 +109,7 @@ See `bb help` or the [`bb` skill](../../.claude/skills/bb/SKILL.md) for the full
 
 ## Design
 
-- **`src/board.ts`** — pure domain core: SQLite (`bun:sqlite`), claims/notes, TTLs, path-overlap conflict detection, per-agent unread cursors. Zero host dependency; usable standalone.
+- **`src/board.ts`** — pure domain core: SQLite (`bun:sqlite`), claims/notes, TTLs, repo-scoped conflict detection (`sameRepoScope`; path-overlap kept for informational queries), per-agent unread cursors. Zero host dependency; usable standalone.
 - **`src/cli.ts`** — the `bb` binary.
 - **`src/toolgate-policy.ts`** — `makeDirectoryClaimPolicy({ ask, next })`. Verdict constructors are injected; the package stays host-agnostic.
 
@@ -117,7 +117,7 @@ Key decisions:
 
 - **Identity** is `$TMUX_PANE` (`tmux:%2`) by default, overridable via `$BB_AGENT`. Distinct panes = distinct agents. Non-tmux runners must set `BB_AGENT`.
 - **TTL is the staleness mechanism.** Claims default to 2h so a crashed or forgotten agent auto-frees the directory. Notes are longer-lived (1d dir, 7d global). All renewable.
-- **Conflict = path overlap.** A claim covers a directory subtree; an op conflicts if its target is at, inside, or contains a claimed dir. Both sides resolve to the git toplevel first, so "claim the repo" and "operate in a subdir" line up.
+- **Conflict = same repository.** A directory claim is scoped to exactly one repo. Both the claim and the op's target resolve to their git toplevel first, then conflict is path *equality* — so "claim the repo" and "operate in a subdir of it" line up, while a repo *nested* under a claimed dir (e.g. `~/ko-work/Sites/*` beneath a claim on `~/ko-work`) keeps its own toplevel and stays independent. Path *containment* is still used for informational queries (`bb check`/`bb list --dir` show what's going on in the whole subtree) and for releasing/renewing your own claims, just never for cross-agent arbitration.
 - **Cursors are id-based**, not timestamp-based — monotonic, immune to clock resolution and skew.
 - **The gate fails open.** Any error → the op proceeds. A coordination tool must never wedge an agent.
 - **Storage is volatile and untracked** (`~/.bulletin-board/board.db`, gitignored) — it's live coordination state, not history to commit.
@@ -128,6 +128,7 @@ Key decisions:
 - **Auto-claim / auto-release** — `SessionStart` claims the cwd repo, `SessionEnd` releases it (`bb hook`).
 - **Context-feed hook** — `UserPromptSubmit` injects other agents' new bulletins into context each turn (`bb hook prompt`), so a mid-session broadcast reaches everyone without a manual `bb unread`.
 - **Resource claims + docker gate** — `bb claim -r <type>:<id>` claims things that aren't directories (containers, ports, deploy slots), matched on an exact key. The gate guards destructive docker ops: container-targeting commands (`stop`/`kill`/`rm`/`restart`/`pause`) against `docker:<name>` claims, and `compose down/stop/restart` against the project's directory claim.
+- **Repo-scoped claims** — a directory claim is scoped to its own git repo, so claiming a parent (e.g. `~/ko-work`) no longer blocks work in repos nested under it (`~/ko-work/Sites/*` are separate toplevels). Conflict, release, and renew all match by repo identity; `bb check`/`bb list --dir` still *show* ancestor and nested claims as context.
 
 ## Roadmap
 

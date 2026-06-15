@@ -245,6 +245,9 @@ export function makeDirectoryClaimPolicy(
         if (process.env.BB_DEBUG)
           console.error(`[bb gate] tool=${call.tool} cmd=${JSON.stringify(command)} git=${JSON.stringify(op)}`);
         if (op) {
+          // Resolve to the op's OWN git toplevel, so findConflicts matches by
+          // repository: a git op in a nested repo (e.g. ~/ko-work/Sites/*) is
+          // gated by a claim on that repo, not by a claim on an ancestor dir.
           const target = canonicalDir(op.dir, cwd);
           const db = openBoard({ create: false });
           if (!db) return deps.next(); // no board yet → nothing claimed
